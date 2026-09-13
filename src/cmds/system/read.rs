@@ -5,6 +5,7 @@ use crate::core::guard::never_worse;
 use crate::core::tracking;
 use anyhow::{Context, Result};
 use std::fs;
+use std::io::{self, Read as IoRead, Write};
 use std::path::Path;
 
 pub fn run(
@@ -23,8 +24,25 @@ pub fn run(
     }
 
     // Read file content
-    let content = fs::read_to_string(file)
+    let bytes = fs::read(file)
         .with_context(|| format!("Failed to read file: {}", file.display()))?;
+    if level == FilterLevel::None && !line_numbers {
+        if let Some(window) = byte_line_window(&bytes, head_lines, tail_lines) {
+            io::stdout()
+                .lock()
+                .write_all(window)
+                .context("Failed to write line window")?;
+            timer.track(
+                &format!("cat {}", file.display()),
+                "rtk read",
+                &String::from_utf8_lossy(&bytes),
+                &String::from_utf8_lossy(window),
+            );
+            return Ok(());
+        }
+    }
+    let content = String::from_utf8(bytes)
+        .with_context(|| format!("Failed to decode file: {}", file.display()))?;
 
     // Detect language from extension
     let lang = file
@@ -94,8 +112,6 @@ pub fn run_stdin(
     line_numbers: bool,
     verbose: u8,
 ) -> Result<()> {
-    use std::io::{self, Read as IoRead};
-
     let timer = tracking::TimedExecution::start();
 
     if verbose > 0 {
@@ -103,11 +119,27 @@ pub fn run_stdin(
     }
 
     // Read from stdin
-    let mut content = String::new();
+    let mut bytes = Vec::new();
     io::stdin()
         .lock()
-        .read_to_string(&mut content)
+        .read_to_end(&mut bytes)
         .context("Failed to read from stdin")?;
+    if level == FilterLevel::None && !line_numbers {
+        if let Some(window) = byte_line_window(&bytes, head_lines, tail_lines) {
+            io::stdout()
+                .lock()
+                .write_all(window)
+                .context("Failed to write line window")?;
+            timer.track(
+                "cat - (stdin)",
+                "rtk read -",
+                &String::from_utf8_lossy(&bytes),
+                &String::from_utf8_lossy(window),
+            );
+            return Ok(());
+        }
+    }
+    let content = String::from_utf8(bytes).context("Failed to decode stdin")?;
 
     // No file extension, so use Unknown language
     let lang = Language::Unknown;
@@ -168,12 +200,8 @@ fn apply_line_window(
     tail_lines: Option<usize>,
     lang: &Language,
 ) -> String {
-    if let Some(head) = head_lines {
-        return head_window(content, head);
-    }
-
-    if let Some(tail) = tail_lines {
-        return tail_window(content, tail);
+    if let Some(window) = byte_line_window(content.as_bytes(), head_lines, tail_lines) {
+        return String::from_utf8_lossy(window).into_owned();
     }
 
     if let Some(max) = max_lines {
@@ -185,46 +213,57 @@ fn apply_line_window(
 
 /// First `n` lines, sliced on byte offsets rather than round-tripped through
 /// `lines()`, so CRLF endings and an unterminated final line survive verbatim.
-/// `\n` is ASCII, so slicing just past one always lands on a char boundary.
-fn head_window(content: &str, n: usize) -> String {
+/// `\n` is ASCII, so valid UTF-8 input also stays valid after slicing.
+fn head_window(content: &[u8], n: usize) -> &[u8] {
     if n == 0 {
-        return String::new();
+        return &[];
     }
     let mut seen = 0;
-    for (idx, byte) in content.bytes().enumerate() {
+    for (idx, &byte) in content.iter().enumerate() {
         if byte == b'\n' {
             seen += 1;
             if seen == n {
-                return content[..=idx].to_string();
+                return &content[..=idx];
             }
         }
     }
-    content.to_string()
+    content
 }
 
 /// Last `n` lines, byte-sliced for the same fidelity reasons as `head_window`.
 /// A trailing newline terminates the final line instead of starting a new one,
 /// so it is excluded before counting separators backwards — otherwise `n` would
 /// select one line too few for newline-terminated input.
-fn tail_window(content: &str, n: usize) -> String {
+fn tail_window(content: &[u8], n: usize) -> &[u8] {
     if n == 0 {
-        return String::new();
+        return &[];
     }
-    let bytes = content.as_bytes();
-    let search_end = match bytes.last() {
-        Some(b'\n') => bytes.len() - 1,
-        _ => bytes.len(),
+    let search_end = match content.last() {
+        Some(b'\n') => content.len() - 1,
+        _ => content.len(),
     };
     let mut seen = 0;
     for idx in (0..search_end).rev() {
-        if bytes[idx] == b'\n' {
+        if content[idx] == b'\n' {
             seen += 1;
             if seen == n {
-                return content[idx + 1..].to_string();
+                return &content[idx + 1..];
             }
         }
     }
-    content.to_string()
+    content
+}
+
+fn byte_line_window(
+    content: &[u8],
+    head_lines: Option<usize>,
+    tail_lines: Option<usize>,
+) -> Option<&[u8]> {
+    if let Some(head) = head_lines {
+        Some(head_window(content, head))
+    } else {
+        tail_lines.map(|tail| tail_window(content, tail))
+    }
 }
 
 #[cfg(test)]
