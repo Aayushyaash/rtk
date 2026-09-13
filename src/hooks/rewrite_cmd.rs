@@ -1,8 +1,64 @@
 //! Translates a raw shell command into its RTK-optimized equivalent.
 
-use super::permissions::{check_command, PermissionVerdict};
-use crate::discover::registry;
+use super::decision::{self, HookDecision};
+use super::permissions::check_command;
 use std::io::Write;
+
+const TEE_READERS: &[&str] = &[
+    "cat", "tail", "head", "less", "more", "bat", "grep", "rg", "sed", "awk",
+];
+
+fn expand_home(token: &str) -> String {
+    if let Some(rest) = token.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest).to_string_lossy().into_owned();
+        }
+    }
+    if let Some(rest) = token.strip_prefix("$HOME/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest).to_string_lossy().into_owned();
+        }
+    }
+    token.to_string()
+}
+
+fn tee_read_slug(cmd: &str, tee_dir: &std::path::Path) -> Option<(String, String)> {
+    let first = cmd.split_whitespace().next()?;
+    let reader = first.rsplit('/').next().unwrap_or(first);
+    if !TEE_READERS.contains(&reader) {
+        return None;
+    }
+    for token in cmd.split_whitespace() {
+        let t = token.trim_matches(|c| c == '"' || c == '\'');
+        if !t.ends_with(".log") {
+            continue;
+        }
+        let expanded = expand_home(t);
+        let path = std::path::Path::new(&expanded);
+        if !path.starts_with(tee_dir) {
+            continue;
+        }
+        let stem = path.file_stem()?.to_str()?;
+        if let Some((epoch, slug)) = stem.split_once('_') {
+            if !epoch.is_empty() && epoch.chars().all(|c| c.is_ascii_digit()) && !slug.is_empty() {
+                return Some((slug.to_string(), expanded));
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn track_tee_read(cmd: &str) {
+    if !cmd.contains(".log") {
+        return;
+    }
+    let Some(tee_dir) = crate::core::tee_file::resolved_tee_dir() else {
+        return;
+    };
+    if let Some((slug, path)) = tee_read_slug(cmd, &tee_dir) {
+        crate::core::retriever::record_tee_recall(&slug, &path);
+    }
+}
 
 /// Run the `rtk rewrite` command.
 ///
@@ -15,58 +71,119 @@ use std::io::Write;
 /// | 1    | (none)   | No RTK equivalent — hook passes through unchanged.           |
 /// | 2    | (none)   | Deny rule matched — hook defers to Claude Code native deny.  |
 /// | 3    | rewritten| Ask rule matched — hook rewrites but lets Claude Code prompt.|
+///
+/// The decision itself is [`decision::decide`], shared with the in-process
+/// `rtk hook <agent>` path; this function is only its exit-code rendering.
 pub fn run(cmd: &str) -> anyhow::Result<()> {
-    let excluded = crate::core::config::Config::load()
-        .map(|c| c.hooks.exclude_commands)
-        .unwrap_or_default();
-
-    // SECURITY: check deny/ask BEFORE rewrite so non-RTK commands are also covered.
-    let verdict = check_command(cmd);
-
-    if verdict == PermissionVerdict::Deny {
-        std::process::exit(2);
+    // `rtk rewrite` is a subprocess entry point with no way to be told which
+    // host is asking, so every delegate that shells out to it -- hermes, omp,
+    // opencode, openclaw, pi -- is judged against `~/.claude`'s rules. The
+    // in-process `rtk hook <agent>` path is host-parameterized instead
+    // (`permissions::Host`).
+    let decided = decision::decide(cmd, check_command(cmd));
+    if !matches!(decided, HookDecision::Deny) {
+        track_tee_read(cmd);
     }
-
-    match registry::rewrite_command(cmd, &excluded) {
-        Some(rewritten) => match verdict {
-            PermissionVerdict::Allow => {
-                print!("{}", rewritten);
-                let _ = std::io::stdout().flush();
-                Ok(())
-            }
-            PermissionVerdict::Ask | PermissionVerdict::Default => {
-                print!("{}", rewritten);
-                let _ = std::io::stdout().flush();
-                std::process::exit(3);
-            }
-            PermissionVerdict::Deny => unreachable!(),
-        },
-        None => {
-            // No RTK equivalent. Exit 1 = passthrough.
-            // Claude Code independently evaluates its own ask rules on the original cmd.
-            std::process::exit(1);
+    match decided {
+        HookDecision::AllowRewrite(rewritten) => {
+            print!("{}", rewritten);
+            let _ = std::io::stdout().flush();
+            Ok(())
         }
+        HookDecision::AskRewrite(rewritten) => {
+            print!("{}", rewritten);
+            let _ = std::io::stdout().flush();
+            std::process::exit(3);
+        }
+        HookDecision::Deny => std::process::exit(2),
+        HookDecision::Defer => std::process::exit(1),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discover::registry;
+
+    #[test]
+    fn test_tee_read_slug_detects_tail_hint_command() {
+        let dir = std::path::Path::new("/home/u/.local/share/rtk/tee");
+        let cmd = "tail -n +52 /home/u/.local/share/rtk/tee/1755590000_docker-images.log";
+        assert_eq!(
+            tee_read_slug(cmd, dir),
+            Some((
+                "docker-images".to_string(),
+                "/home/u/.local/share/rtk/tee/1755590000_docker-images.log".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_tee_read_slug_detects_quoted_and_grep() {
+        let dir = std::path::Path::new("/home/u/.local/share/rtk/tee");
+        let cmd = r#"grep error "/home/u/.local/share/rtk/tee/1755590000_cargo_test.log""#;
+        assert_eq!(
+            tee_read_slug(cmd, dir).map(|(s, _)| s),
+            Some("cargo_test".to_string())
+        );
+    }
+
+    #[test]
+    fn test_tee_read_slug_ignores_non_readers() {
+        let dir = std::path::Path::new("/home/u/.local/share/rtk/tee");
+        for cmd in [
+            "rm /home/u/.local/share/rtk/tee/1755590000_x.log",
+            "ls /home/u/.local/share/rtk/tee",
+            "mv /home/u/.local/share/rtk/tee/1755590000_x.log /tmp/",
+        ] {
+            assert_eq!(tee_read_slug(cmd, dir), None, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn test_tee_read_slug_ignores_logs_outside_tee_dir() {
+        let dir = std::path::Path::new("/home/u/.local/share/rtk/tee");
+        assert_eq!(tee_read_slug("cat /var/log/app_server.log", dir), None);
+        assert_eq!(tee_read_slug("tail -f ./build_1234_out.log", dir), None);
+    }
+
+    #[test]
+    fn test_tee_read_slug_requires_epoch_prefix() {
+        let dir = std::path::Path::new("/home/u/.local/share/rtk/tee");
+        assert_eq!(
+            tee_read_slug("cat /home/u/.local/share/rtk/tee/notes_perso.log", dir),
+            None
+        );
+    }
+
+    #[test]
+    fn test_tee_read_slug_reader_with_absolute_path() {
+        let dir = std::path::Path::new("/home/u/.local/share/rtk/tee");
+        let cmd = "/usr/bin/tail -n +5 /home/u/.local/share/rtk/tee/17_gh-prs.log";
+        assert_eq!(
+            tee_read_slug(cmd, dir).map(|(s, _)| s),
+            Some("gh-prs".to_string())
+        );
+    }
+
+    fn rewrite_command_no_prefixes(cmd: &str) -> Option<String> {
+        registry::rewrite_command(cmd, &[], &[])
+    }
 
     #[test]
     fn test_run_supported_command_succeeds() {
-        assert!(registry::rewrite_command("git status", &[]).is_some());
+        assert!(rewrite_command_no_prefixes("git status").is_some());
     }
 
     #[test]
     fn test_run_unsupported_returns_none() {
-        assert!(registry::rewrite_command("htop", &[]).is_none());
+        assert!(rewrite_command_no_prefixes("htop").is_none());
     }
 
     #[test]
     fn test_run_already_rtk_returns_some() {
         assert_eq!(
-            registry::rewrite_command("rtk git status", &[]),
+            rewrite_command_no_prefixes("rtk git status"),
             Some("rtk git status".into())
         );
     }
@@ -148,7 +265,7 @@ mod tests {
 
             // Verify the rewrite exists (so the hook would output it),
             // but the exit code forces user confirmation.
-            assert!(registry::rewrite_command("git status", &[]).is_some());
+            assert!(registry::rewrite_command("git status", &[], &[]).is_some());
             assert_eq!(expected_exit_code(&verdict), 3);
         }
 
