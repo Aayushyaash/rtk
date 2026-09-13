@@ -128,6 +128,8 @@ fn rewritten_head_spellings_match_native_on_non_utf8_files() {
     let dir = tempfile::tempdir().expect("create test directory");
     let claude_dir = dir.path().join(".claude");
     fs::create_dir(&claude_dir).expect("create isolated Claude config directory");
+    let config_dir = dir.path().join("config");
+    fs::create_dir(&config_dir).expect("create isolated rtk config directory");
     let file = dir.path().join("binary.log");
     fs::write(&file, b"\xff\xfe bad\nline2\nline3\n").expect("write binary file");
     for flags in ["-2", "-n 2", "--lines 2", "--lines=2", ""] {
@@ -135,6 +137,7 @@ fn rewritten_head_spellings_match_native_on_non_utf8_files() {
         let rewrite = Command::new(env!("CARGO_BIN_EXE_rtk"))
             .current_dir(dir.path())
             .env("CLAUDE_CONFIG_DIR", &claude_dir)
+            .env("XDG_CONFIG_HOME", &config_dir)
             .args(["rewrite", &command])
             .output()
             .expect("rewrite head command");
