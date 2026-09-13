@@ -202,7 +202,7 @@ pub struct GainSummary {
     pub total_time_ms: u64,
     /// Average execution time per command (milliseconds)
     pub avg_time_ms: u64,
-    /// Top 10 commands by tokens saved: (cmd, count, saved, avg_pct, avg_time_ms)
+    /// Top 10 commands by tokens saved: (cmd, count, saved, weighted_rate, avg_time_ms)
     pub by_command: Vec<(String, usize, usize, f64, u64)>,
     /// Last 30 days of activity: (date, saved_tokens)
     pub by_day: Vec<(String, usize)>,
@@ -298,9 +298,13 @@ pub struct MonthStats {
 /// Type alias for command statistics tuple: (command, count, saved_tokens, weighted_savings_rate, avg_time_ms)
 ///
 /// # Warning
-/// The 4th field is a **weighted** savings rate: `SUM(saved_tokens) * 100.0 / SUM(input_tokens)`.
+/// The 4th field is a **weighted** savings rate: `SUM(saved_tokens) / SUM(input_tokens) * 100.0`,
+/// guarded so that a group whose every row has zero input reports 0.0 rather than NULL.
 /// Do NOT aggregate this column with `AVG()` — that would produce an unweighted mean that
-/// under-weights high-volume commands. Always use `SUM(saved) / SUM(input)` instead.
+/// under-weights high-volume commands. Always recompute it as
+/// `CASE WHEN SUM(input_tokens) > 0 THEN SUM(saved_tokens) / SUM(input_tokens) * 100.0 ELSE 0.0 END`
+/// instead. `saved_tokens` is signed, so the rate can be negative where the 3rd field, being
+/// unsigned, is clamped to 0.
 type CommandStats = (String, usize, usize, f64, u64);
 
 /// Current tracking-DB schema version, stored in the SQLite `user_version` pragma.
@@ -2551,15 +2555,13 @@ mod tests {
     // Setup: one small command (10% savings) + one large command (95% savings).
     // Unweighted avg would be ~52.5%. Weighted rate must be ~95%.
     //
-    // Uses a unique fake project path so project-filtered query returns only our rows,
-    // avoiding the LIMIT 10 cap on the shared DB.
+    // Rows carry a project path so the project-filtered form of the query is the one
+    // under test.
     #[test]
     fn test_get_by_command_weighted_savings_rate() {
-        let tracker = Tracker::new().expect("Failed to create tracker");
-        let pid = std::process::id();
-        let cmd_name = format!("weighted_test_{}", pid);
-        // Unique project path keeps our rows isolated from the shared DB
-        let fake_project = format!("/tmp/rtk_weighted_test_{}", pid);
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
+        let cmd_name = "weighted_test";
+        let project = "/tmp/rtk_weighted_test";
 
         // Override project_path by inserting directly via conn
         let saved_small = 10_i64; // 100 in - 90 out = 10 saved → 10%
@@ -2571,7 +2573,7 @@ mod tests {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 rusqlite::params![
                     chrono::Utc::now().to_rfc3339(),
-                    &cmd_name, &cmd_name, &fake_project,
+                    cmd_name, cmd_name, project,
                     100_i64, 90_i64, saved_small, 10.0_f64, 5_i64
                 ],
             )
@@ -2583,24 +2585,24 @@ mod tests {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 rusqlite::params![
                     chrono::Utc::now().to_rfc3339(),
-                    &cmd_name, &cmd_name, &fake_project,
+                    cmd_name, cmd_name, project,
                     100_000_i64, 5_000_i64, saved_large, 95.0_f64, 10_i64
                 ],
             )
             .expect("Failed to insert large invocation");
 
         let by_cmd = tracker
-            .get_by_command(Some(&fake_project))
+            .get_by_command(Some(project))
             .expect("Failed to get by_command stats");
 
         let entry = by_cmd
             .iter()
-            .find(|(name, _, _, _, _)| name == &cmd_name)
+            .find(|(name, _, _, _, _)| name == cmd_name)
             .expect("Test command not found in by_command stats");
 
         let (_name, _count, _saved, rate, _time) = entry;
 
-        // Weighted rate = (10 + 95_000) * 100.0 / (100 + 100_000) ≈ 94.99%
+        // Weighted rate = (10 + 95_000) / (100 + 100_000) * 100.0 ≈ 94.9%
         // Unweighted avg would be (10.0 + 95.0) / 2 = 52.5%
         // The gap proves the fix works.
         assert!(
@@ -2608,5 +2610,87 @@ mod tests {
             "Expected weighted rate >90%, got {:.1}% — unweighted avg would be ~52.5%",
             rate
         );
+    }
+
+    // 15. The weighted rate tracks SUM(saved_tokens), not the mean of per-call percentages
+    //
+    // A long-tailed pair under one rtk_cmd: a 1M-token call saving 90% and a 100-token
+    // call saving 10%. The mean of the two percentages is 50%; the weighted rate is
+    // ~89.99% and is the figure consistent with the Saved column in the same row.
+    #[test]
+    fn test_weighted_rate_via_get_by_command() {
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
+
+        tracker
+            .record("grep huge", "rtk grep", 1_000_000, 100_000, 50)
+            .expect("record huge");
+        tracker
+            .record("grep tiny", "rtk grep", 100, 90, 5)
+            .expect("record tiny");
+
+        let by_command = tracker.get_by_command(None).expect("get_by_command");
+
+        let (_cmd, count, saved, pct, _avg_time) = by_command
+            .iter()
+            .find(|(cmd, ..)| cmd == "rtk grep")
+            .expect("rtk grep row not found");
+
+        assert_eq!(*count, 2);
+        assert_eq!(*saved, 900_010);
+        let expected = 900_010.0 / 1_000_100.0 * 100.0;
+        assert!(
+            (pct - expected).abs() < 0.01,
+            "expected weighted rate ~{expected:.2}, got {pct:.2}"
+        );
+        assert!(
+            (pct - 50.0).abs() > 1.0,
+            "mean-of-percentages regression: got {pct:.2}"
+        );
+    }
+
+    // 16. The rate reaches the gain summary through get_summary(), not only get_by_command
+    #[test]
+    fn test_weighted_rate_via_get_summary() {
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
+
+        tracker
+            .record("large grep", "rtk grep", 1000, 100, 10)
+            .expect("Failed to record large command");
+        tracker
+            .record("small grep", "rtk grep", 10, 9, 20)
+            .expect("Failed to record small command");
+
+        let summary = tracker.get_summary().expect("Failed to get summary");
+        let (_, count, saved, savings_pct, _) = summary
+            .by_command
+            .iter()
+            .find(|(command, _, _, _, _)| command == "rtk grep")
+            .expect("rtk grep stats not found");
+
+        assert_eq!(*count, 2);
+        assert_eq!(*saved, 901);
+        let expected_pct = 901.0 / 1010.0 * 100.0;
+        assert!(
+            (savings_pct - expected_pct).abs() < 1e-10,
+            "expected weighted rate {expected_pct}, got {savings_pct}"
+        );
+    }
+
+    // 17. A group whose every call has zero input reports 0%, not a division by zero
+    #[test]
+    fn test_by_command_zero_input_has_zero_savings_percentage() {
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
+        tracker
+            .record("interactive command", "rtk proxy", 0, 0, 5)
+            .expect("Failed to record passthrough command");
+
+        let summary = tracker.get_summary().expect("Failed to get summary");
+        let (_, _, _, savings_pct, _) = summary
+            .by_command
+            .iter()
+            .find(|(command, _, _, _, _)| command == "rtk proxy")
+            .expect("rtk proxy stats not found");
+
+        assert_eq!(*savings_pct, 0.0);
     }
 }
