@@ -126,15 +126,24 @@ fn read_windows_still_apply_text_filtering_and_line_numbers() {
 #[test]
 fn rewritten_head_spellings_match_native_on_non_utf8_files() {
     let dir = tempfile::tempdir().expect("create test directory");
+    let claude_dir = dir.path().join(".claude");
+    fs::create_dir(&claude_dir).expect("create isolated Claude config directory");
     let file = dir.path().join("binary.log");
     fs::write(&file, b"\xff\xfe bad\nline2\nline3\n").expect("write binary file");
     for flags in ["-2", "-n 2", "--lines 2", "--lines=2", ""] {
         let command = format!("head {flags} {}", file.display());
         let rewrite = Command::new(env!("CARGO_BIN_EXE_rtk"))
+            .current_dir(dir.path())
+            .env("CLAUDE_CONFIG_DIR", &claude_dir)
             .args(["rewrite", &command])
             .output()
             .expect("rewrite head command");
-        assert!(rewrite.status.success(), "{command}: {:?}", rewrite.stderr);
+        assert_eq!(
+            rewrite.status.code(),
+            Some(3),
+            "{command}: {:?}",
+            rewrite.stderr
+        );
         let rewritten = String::from_utf8(rewrite.stdout).expect("UTF-8 command");
         let count = if flags.is_empty() { "10" } else { "2" };
         assert_eq!(
