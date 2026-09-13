@@ -16,10 +16,31 @@ static MATCH_LINE_RE: LazyLock<regex::Regex> =
 const DEFAULT_MAX_TOTAL: usize = 50;
 const DEFAULT_MAX_PER_FILE: usize = 5;
 
+/// Counts non-blank lines that are not `path:line:content`.
+///
+/// Plain `ast-grep run` output is made up entirely of that shape. Other modes
+/// are not: in an `ast-grep scan` diagnostic only the `  ┌─ a.rs:2:13` locator
+/// parses, while the rule id, severity, message and source line do not, and
+/// `--heading` mode and Windows drive-letter paths (`C:\src\a.rs`, which
+/// `[^:]+` cannot match) fail to parse the same way. Grouping such a shape
+/// would keep whichever lines happen to parse and discard the rest, so any
+/// non-zero count leaves the output alone. `search.rs::unparsed_signal` guards
+/// grep/rg with the same rule.
+fn unparsed_signal(raw: &str) -> usize {
+    raw.lines()
+        .filter(|line| !line.trim().is_empty() && !MATCH_LINE_RE.is_match(line))
+        .count()
+}
+
 /// Groups raw `ast-grep run` plain output by file, keeping at most
-/// `max_per_file` lines per file and `max_total` lines overall. Files beyond
-/// the cap collapse to a one-line count so nothing silently disappears.
+/// `max_per_file` lines per file and `max_total` lines overall. Every line the
+/// caps hold back is counted in a hint, so nothing disappears silently; any
+/// other output shape is returned unchanged.
 fn filter_ast_grep(raw: &str, max_per_file: usize, max_total: usize) -> String {
+    if unparsed_signal(raw) > 0 {
+        return raw.to_string();
+    }
+
     let mut by_file: HashMap<&str, Vec<(usize, &str)>> = HashMap::new();
     let mut order: Vec<&str> = Vec::new();
 
@@ -50,6 +71,7 @@ fn filter_ast_grep(raw: &str, max_per_file: usize, max_total: usize) -> String {
             skipped_files += 1;
             continue;
         }
+        let mut shown_here = 0;
         for (line_num, content) in entries.iter().take(max_per_file) {
             if shown_total >= max_total {
                 break;
@@ -61,11 +83,16 @@ fn filter_ast_grep(raw: &str, max_per_file: usize, max_total: usize) -> String {
             out.push_str(content);
             out.push('\n');
             shown_total += 1;
+            shown_here += 1;
         }
-        if entries.len() > max_per_file {
+        // `shown_here`, not `max_per_file`: `max_total` can cut a file short of
+        // its own cap, and the hint has to cover every line this loop skipped.
+        // ast-grep prints one line per matched source line and a structural
+        // match spans several, so the unit is lines rather than matches.
+        if entries.len() > shown_here {
             out.push_str(&format!(
-                "  … {} more matches in {}\n",
-                entries.len() - max_per_file,
+                "  … {} more match line(s) in {}\n",
+                entries.len() - shown_here,
                 file
             ));
         }
@@ -130,7 +157,7 @@ src/b.rs:10:fn qux() {}
         assert!(out.contains("src/a.rs:1:"));
         assert!(out.contains("src/a.rs:2:"));
         assert!(!out.contains("src/a.rs:3:"));
-        assert!(out.contains("1 more matches in src/a.rs"));
+        assert!(out.contains("1 more match line(s) in src/a.rs"));
         assert!(out.contains("src/b.rs:10:"));
     }
 
@@ -143,6 +170,44 @@ src/b.rs:10:fn qux() {}
     fn test_unparseable_input_falls_back_unchanged() {
         let input = "no colons here\njust plain text\n";
         assert_eq!(filter_ast_grep(input, 5, 50), input);
+    }
+
+    /// A scan diagnostic parses only on its locator line, so grouping it would
+    /// keep `  ┌─ a.rs:2:13` and discard the rule id, severity, message and
+    /// source line.
+    #[test]
+    fn test_scan_diagnostic_shape_passes_through() {
+        let input = "\
+warning[no-unwrap]: avoid unwrap
+  ┌─ a.rs:2:13
+  │
+2 │     let x = foo().unwrap();
+  │             ^^^^^^^^^^^^^^
+";
+        assert_eq!(filter_ast_grep(input, 5, 50), input);
+    }
+
+    /// `max_total` can cut a file short before its own `max_per_file` cap is
+    /// reached; the per-file hint must still account for the remainder.
+    #[test]
+    fn test_total_cap_hints_lines_it_cut() {
+        let input = "\
+a.rs:1:one
+a.rs:2:two
+a.rs:3:three
+a.rs:4:four
+a.rs:5:five
+b.rs:1:six
+b.rs:2:seven
+b.rs:3:eight
+";
+        let out = filter_ast_grep(input, 5, 6);
+        assert!(out.contains("b.rs:1:six"), "{out}");
+        assert!(!out.contains("b.rs:2:seven"), "{out}");
+        assert!(
+            out.contains("2 more match line(s) in b.rs"),
+            "cut lines must be hinted, got: {out}"
+        );
     }
 
     #[test]

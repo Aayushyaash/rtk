@@ -247,7 +247,7 @@ src/ls.rs:25:fn run_tree(...)                src/ls.rs
 rtk ast-grep run -p '<pattern>' [chemin] [options]
 ```
 
-Regroupe les correspondances par fichier, plafonnees a 5 par fichier et 50 au total ; le surplus est remplace par une note de comptage ("N more matches in X" / "N more file(s) not shown"). Sur une recherche reelle dans ce depot, ~85% de reduction.
+Regroupe les correspondances par fichier, plafonnees a 5 par fichier et 50 au total ; le surplus est remplace par une note de comptage ("N more match line(s) in X" / "N more file(s) not shown"). ast-grep imprime une ligne par ligne source d'une correspondance, et une correspondance structurelle s'etend sur plusieurs lignes : le decompte porte donc sur les lignes, pas sur les correspondances. Les sorties que rtk ne sait pas decouper (`ast-grep scan`, `--heading`) passent telles quelles. Sur une recherche reelle dans ce depot, ~85% de reduction.
 
 `--json` n'est pas filtre -- une demande explicite de sortie structuree passe telle quelle, sans compression.
 
