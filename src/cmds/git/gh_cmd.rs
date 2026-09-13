@@ -1182,7 +1182,7 @@ mod tests {
     #[test]
     fn test_format_pr_checks_uses_final_status_for_each_check() {
         let output = concat!(
-            "Lint\t*\t\thttps://example.com/lint\n",
+            "Lint\tpending\t0\thttps://example.com/lint\n",
             "Unit tests\tfail\t1m\thttps://example.com/unit\n",
             "Lint\tpass\t30s\thttps://example.com/lint\n",
             "Unit tests\tfail\t1m\thttps://example.com/unit\n",
@@ -1207,6 +1207,27 @@ mod tests {
 
         assert!(result.contains("Passed: 1"));
         assert!(result.contains("Failed: 1"));
+    }
+
+    /// Rows exactly as `gh` prints them when stdout is a pipe: five tab-separated
+    /// fields, the fifth (the description) usually empty. Captured from
+    /// `gh pr checks --watch` against a run that was still going, so the pending
+    /// rows here are the shape a real transition arrives in.
+    #[test]
+    fn test_format_pr_checks_handles_real_gh_row_shape() {
+        let output = concat!(
+            "test (macos-latest)\tpending\t0\thttps://example.com/job/1\t\n",
+            "clippy\tpass\t28s\thttps://example.com/job/2\t\n",
+            "license/cla\tpass\t0\thttps://cla.example.com/pr/1\tContributor License Agreement is signed.\n",
+            "test (macos-latest)\tpass\t3m1s\thttps://example.com/job/1\t\n",
+            "clippy\tpass\t28s\thttps://example.com/job/2\t\n",
+            "license/cla\tpass\t0\thttps://cla.example.com/pr/1\tContributor License Agreement is signed.\n",
+        );
+
+        let result = format_pr_checks(output);
+
+        assert!(result.contains("Passed: 3"), "got:\n{result}");
+        assert!(!result.contains("Pending:"), "got:\n{result}");
     }
 
     // --- parse_optional_identifier tests ---
