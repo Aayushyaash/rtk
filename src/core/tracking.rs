@@ -1323,12 +1323,21 @@ impl Tracker {
     }
 
     /// Count commands with low savings (<30%) — filters that need improvement.
+    ///
+    /// Uses the same weighted rate as `get_by_command`, `SUM(saved_tokens) / SUM(input_tokens)`
+    /// over every call of the command, so that a handful of 0%-savings passthrough calls don't
+    /// dilute a filter that genuinely performs well on high-volume invocations, and so that the
+    /// figure sent here is the one `rtk gain` prints for the same command. A net-regressing
+    /// command (negative rate) is listed: it is the filter most in need of improvement. Exact
+    /// 0% is left out, `passthrough_top` already reports it, and a command whose calls never
+    /// had any input carries no signal, so it is skipped rather than reported as 0%.
     pub fn low_savings_commands(&self, limit: usize) -> Result<Vec<(String, f64)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT rtk_cmd, AVG(savings_pct) as avg_sav FROM commands
-             WHERE input_tokens > 0
+            "SELECT rtk_cmd,
+                    SUM(saved_tokens) * 100.0 / SUM(input_tokens) AS sav
+             FROM commands
              GROUP BY rtk_cmd
-             HAVING avg_sav < 30.0 AND avg_sav > 0.0
+             HAVING SUM(input_tokens) > 0 AND sav < 30.0 AND sav <> 0.0
              ORDER BY COUNT(*) DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
@@ -1340,7 +1349,15 @@ impl Tracker {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// Average savings percentage per command (unweighted — each command name counts once).
+    /// Average savings percentage per command (unweighted across command names — each distinct
+    /// command counts once, regardless of how many times it was invoked).
+    ///
+    /// The *inner* rate per command is weighted by volume (`SUM(saved)/SUM(input)`) so that
+    /// passthrough calls don't dilute a command's own rate. The *outer* average across command
+    /// names stays unweighted — this is intentional: it gives equal weight to every filter
+    /// instead of being dominated by the most-called one. Documented in `docs/TELEMETRY.md`.
+    /// A command whose calls never had any input carries no signal about its filter and is
+    /// skipped, not counted as 0%.
     ///
     /// Keeps the honest signed value: a command whose filter consistently emits
     /// more than it saves yields a negative average, mirroring `overall_savings_pct`
@@ -1349,10 +1366,12 @@ impl Tracker {
     /// not on a `0..=100` floor.
     pub fn avg_savings_per_command(&self) -> Result<f64> {
         let avg: f64 = self.conn.query_row(
-            "SELECT COALESCE(AVG(avg_sav), 0.0) FROM (
-                SELECT rtk_cmd, AVG(savings_pct) as avg_sav
-                FROM commands WHERE input_tokens > 0
+            "SELECT COALESCE(AVG(cmd_rate), 0.0) FROM (
+                SELECT rtk_cmd,
+                       SUM(saved_tokens) * 100.0 / SUM(input_tokens) AS cmd_rate
+                FROM commands
                 GROUP BY rtk_cmd
+                HAVING SUM(input_tokens) > 0
             )",
             [],
             |row| row.get(0),
@@ -2692,5 +2711,112 @@ mod tests {
             .expect("rtk proxy stats not found");
 
         assert_eq!(*savings_pct, 0.0);
+    }
+
+    // 18. low_savings_commands reports the same weighted rate as the `rtk gain` By Command
+    // table, including net-regressing commands, and nothing for commands without input.
+    //
+    // `rtk ls -R`: one 95% call plus four 0% passthrough calls. Unweighted AVG(savings_pct)
+    // over those five rows is 19%, under the 30% threshold, so the command would reach
+    // telemetry as low-savings while `get_by_command` shows it at ~94.6% in the same
+    // `rtk gain` run. Weighted, 95_000 / 100_400 ≈ 94.6%: not listed.
+    // `rtk grep`: 25% on one call, then a call with no input that still printed 10 tokens.
+    // Every row counts, as in `get_by_command`: (250 - 10) / 1_000 = 24%, listed at 24.
+    // `rtk read`: emits more than it saves, -50%. Listed: it is the filter to fix first.
+    // `rtk proxy`: never had any input. Nothing to say about its filter, not listed.
+    #[test]
+    fn test_low_savings_commands_matches_gain_weighted_rate() {
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
+        tracker
+            .record("ls -R big", "rtk ls -R", 100_000, 5_000, 10)
+            .expect("record big call");
+        for _ in 0..4 {
+            tracker
+                .record("ls -R empty", "rtk ls -R", 100, 100, 5)
+                .expect("record passthrough call");
+        }
+        tracker
+            .record("grep x", "rtk grep", 1_000, 750, 5)
+            .expect("record 25% call");
+        tracker
+            .record("grep none", "rtk grep", 0, 10, 5)
+            .expect("record no-input call");
+        tracker
+            .record("read big.json", "rtk read", 100, 150, 5)
+            .expect("record regressing call");
+        tracker
+            .record("interactive", "rtk proxy", 0, 0, 5)
+            .expect("record zero-input call");
+
+        let low = tracker
+            .low_savings_commands(10)
+            .expect("low_savings_commands");
+        let listed: Vec<(&str, f64)> = low.iter().map(|(n, r)| (n.as_str(), *r)).collect();
+        assert_eq!(
+            listed.len(),
+            2,
+            "expected `rtk grep` (24%) and `rtk read` (-50%); ~94.6% weighted must not be \
+             listed (unweighted AVG(savings_pct) would put it at 19%), got {listed:?}"
+        );
+        assert_eq!(listed[0].0, "rtk grep");
+        assert!((listed[0].1 - 24.0).abs() < 1e-9, "got {listed:?}");
+        assert_eq!(listed[1].0, "rtk read");
+        assert!((listed[1].1 - (-50.0)).abs() < 1e-9, "got {listed:?}");
+
+        // The figure sent to telemetry is the one `rtk gain` prints for the same command.
+        let summary = tracker.get_summary().expect("get_summary");
+        for (name, rate) in &low {
+            let (_, _, _, gain_rate, _) = summary
+                .by_command
+                .iter()
+                .find(|(command, _, _, _, _)| command == name)
+                .unwrap_or_else(|| panic!("{name} missing from by_command"));
+            assert!(
+                (gain_rate - rate).abs() < 1e-9,
+                "{name}: telemetry says {rate}, rtk gain says {gain_rate}"
+            );
+        }
+    }
+
+    // 19. avg_savings_per_command weights each command's own rate by volume (every call
+    // counted, as in test 18), then averages the per-command rates without weighting: each
+    // command name counts once, and a command that never had any input is not counted.
+    //
+    // Same rows as test 18: `rtk ls -R` ≈ 94.6% (19% if the inner aggregate were
+    // AVG(savings_pct)), `rtk grep` 24%, `rtk read` -50%, `rtk proxy` skipped.
+    #[test]
+    fn test_avg_savings_per_command_inner_rate_is_weighted() {
+        let tracker = Tracker::new_in_memory().expect("Failed to create tracker");
+        tracker
+            .record("ls -R big", "rtk ls -R", 100_000, 5_000, 10)
+            .expect("record big call");
+        for _ in 0..4 {
+            tracker
+                .record("ls -R empty", "rtk ls -R", 100, 100, 5)
+                .expect("record passthrough call");
+        }
+        tracker
+            .record("grep x", "rtk grep", 1_000, 750, 5)
+            .expect("record 25% call");
+        tracker
+            .record("grep none", "rtk grep", 0, 10, 5)
+            .expect("record no-input call");
+        tracker
+            .record("read big.json", "rtk read", 100, 150, 5)
+            .expect("record regressing call");
+        tracker
+            .record("interactive", "rtk proxy", 0, 0, 5)
+            .expect("record zero-input call");
+
+        let avg = tracker
+            .avg_savings_per_command()
+            .expect("avg_savings_per_command");
+        let ls_rate = 95_000.0 * 100.0 / 100_400.0;
+        let expected = (ls_rate + 24.0 - 50.0) / 3.0;
+        assert!(
+            (avg - expected).abs() < 1e-6,
+            "expected ({ls_rate:.1} + 24 - 50) / 3 = {expected:.1}%, got {avg:.1}% \
+             (an unweighted inner AVG(savings_pct) would give (19 + 12.5 - 50) / 3 = -6.2%)"
+        );
     }
 }
