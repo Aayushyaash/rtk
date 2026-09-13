@@ -80,7 +80,7 @@ static GIT_GLOBAL_OPT: LazyLock<Regex> = LazyLock::new(|| {
 // Issue #1362: each capture expects a SINGLE file argument (`\S+$`). Multi-file
 // invocations like `head -3 a b c` fail to match so the segment is passed through
 // to the native `head`/`tail` binary — which already handles multi-file with
-// `==> name <==` banners that `rtk read --max-lines` cannot reproduce.
+// `==> name <==` banners that a single `rtk read` window cannot reproduce.
 static HEAD_N: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^head\s+-(\d+)\s+(\S+)$").unwrap());
 static HEAD_LINES: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^head\s+--lines=(\d+)\s+(\S+)$").unwrap());
@@ -1589,9 +1589,7 @@ fn rewrite_segment_inner(
     }
 
     if context == RewriteContext::Normal
-        && (cmd_part.starts_with("head -")
-            || cmd_part.starts_with("head ")
-            || cmd_part.starts_with("tail "))
+        && (cmd_part.starts_with("head ") || cmd_part.starts_with("tail "))
     {
         // head/tail rewrite to `rtk read`, so honour exclude_commands here too:
         // this branch returns before the checks below. Any env prefix has already
