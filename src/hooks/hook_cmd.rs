@@ -564,6 +564,7 @@ enum PayloadAction {
     },
     Skip {
         decision: HookOutcome,
+        reason: &'static str,
         cmd: String,
     },
     Ignore,
@@ -617,12 +618,14 @@ fn process_claude_payload_from_decision(
         HookDecision::Deny => {
             return PayloadAction::Skip {
                 decision: HookOutcome::Deny,
+                reason: "skip:deny_rule",
                 cmd: cmd.to_string(),
             }
         }
         HookDecision::Defer => {
             return PayloadAction::Skip {
                 decision: HookOutcome::Defer,
+                reason: "skip:defer",
                 cmd: cmd.to_string(),
             }
         }
@@ -722,22 +725,20 @@ pub fn run_claude() -> Result<()> {
             audit_log("rewrite", &cmd, &rewritten);
             log_hook_decision(&v, &cmd, decision, Some(&rewritten));
         }
-        PayloadAction::Skip { decision, cmd } => {
+        PayloadAction::Skip {
+            decision,
+            cmd,
+            reason,
+        } => {
             // `rtk hook audit`'s skip-breakdown groups by a "skip:<reason>" prefix
-            // (see hook_audit_cmd.rs) — Skip is only ever reached via Deny/Defer,
-            // so map those to the reasons it expects rather than the bare
-            // HookOutcome::Display used for the Rewrite/tracking-DB paths.
+            // (see hook_audit_cmd.rs). Carry the reason separately from the
+            // decision so distinct defer causes remain diagnosable.
             //
             // Skip has no stdout response to write (Claude Code falls through to
             // its own native handling), but log_hook_decision is still deferred to
             // last for the same reason as the Rewrite arm above: it must never be
             // what a Bash tool call is waiting on.
-            let audit_action = match decision {
-                HookOutcome::Deny => "skip:deny_rule",
-                HookOutcome::Defer => "skip:defer",
-                HookOutcome::Allow | HookOutcome::Ask => "skip",
-            };
-            audit_log(audit_action, &cmd, "");
+            audit_log(reason, &cmd, "");
             log_hook_decision(&v, &cmd, decision, None);
         }
         PayloadAction::Ignore => {}
@@ -789,6 +790,7 @@ fn process_codex_payload(v: &Value) -> PayloadAction {
     if !is_supported_codex_permission_mode(v) {
         return PayloadAction::Skip {
             decision: HookOutcome::Defer,
+            reason: "skip:unsupported_permission_mode",
             cmd: cmd.to_string(),
         };
     }
@@ -796,21 +798,41 @@ fn process_codex_payload(v: &Value) -> PayloadAction {
     if crate::discover::lexer::contains_unattestable_construct(cmd) {
         return PayloadAction::Skip {
             decision: HookOutcome::Defer,
+            reason: "skip:defer",
             cmd: cmd.to_string(),
         };
     }
 
-    let rewritten = match get_rewritten(cmd) {
-        Some(rewritten) => rewritten,
-        None => {
+    process_codex_payload_from_decision(v, cmd, decide_hook_action(cmd, permissions::Host::Codex))
+}
+
+fn process_codex_payload_from_decision(
+    v: &Value,
+    cmd: &str,
+    decision: HookDecision,
+) -> PayloadAction {
+    let (rewritten, outcome) = match decision {
+        HookDecision::AllowRewrite(rewritten) => (rewritten, HookOutcome::Allow),
+        HookDecision::AskRewrite(rewritten) => (rewritten, HookOutcome::Ask),
+        HookDecision::Deny => {
+            return PayloadAction::Skip {
+                decision: HookOutcome::Deny,
+                reason: "skip:deny_rule",
+                cmd: cmd.to_string(),
+            }
+        }
+        HookDecision::Defer => {
             return PayloadAction::Skip {
                 decision: HookOutcome::Defer,
+                reason: "skip:no_rewrite",
                 cmd: cmd.to_string(),
             }
         }
     };
 
-    // Codex requires `permissionDecision: allow` alongside `updatedInput`.
+    // Both AllowRewrite and AskRewrite require protocol-level allow: Codex
+    // cannot accept updatedInput with ask or an omitted permissionDecision.
+    // The internal outcome remains Ask for Default, not an RTK auto-approval.
     // Its runtime applies the replacement before native approval and sandbox
     // checks, so this is a protocol-level allow rather than RTK approving the
     // command. Those checks inspect the rewritten argv, however, and Codex's
@@ -821,7 +843,7 @@ fn process_codex_payload(v: &Value) -> PayloadAction {
     PayloadAction::Rewrite {
         cmd: cmd.to_string(),
         output: pre_tool_use_rewrite_output(v, &rewritten, Some("allow")),
-        decision: HookOutcome::Allow,
+        decision: outcome,
         rewritten,
     }
 }
@@ -858,7 +880,7 @@ pub fn run_codex() -> Result<()> {
             audit_log("rewrite", &cmd, &rewritten);
             let _ = writeln!(io::stdout(), "{output}");
         }
-        PayloadAction::Skip { cmd, .. } => audit_log("skip:defer", &cmd, ""),
+        PayloadAction::Skip { cmd, reason, .. } => audit_log(reason, &cmd, ""),
         PayloadAction::Ignore => {}
     }
 
@@ -1916,6 +1938,70 @@ mod tests {
         assert_eq!(hook["permissionDecision"], "allow");
         assert_eq!(hook["permissionDecisionReason"], "RTK auto-rewrite");
         assert_eq!(hook["updatedInput"]["command"], "rtk git status");
+    }
+
+    #[test]
+    fn test_codex_shared_decision_preserves_host_approval_and_deny() {
+        let input = json!({"tool_input": {"command": "git status", "timeout": 30000}});
+        for (verdict, expected) in [
+            (PermissionVerdict::Default, HookOutcome::Ask),
+            (PermissionVerdict::Ask, HookOutcome::Ask),
+            (PermissionVerdict::Allow, HookOutcome::Allow),
+        ] {
+            let decision =
+                super::super::decision::decide_with_params("git status", verdict, &[], &[]);
+            let PayloadAction::Rewrite {
+                output, decision, ..
+            } = process_codex_payload_from_decision(&input, "git status", decision)
+            else {
+                panic!("expected rewrite")
+            };
+            assert_eq!(decision, expected);
+            assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "allow");
+            assert_eq!(
+                output["hookSpecificOutput"]["updatedInput"]["timeout"],
+                30000
+            );
+            assert_eq!(
+                output["hookSpecificOutput"]["updatedInput"]["command"],
+                "rtk git status"
+            );
+        }
+        let denied = super::super::decision::decide_with_params(
+            "git status",
+            PermissionVerdict::Deny,
+            &[],
+            &[],
+        );
+        assert!(matches!(
+            process_codex_payload_from_decision(&input, "git status", denied),
+            PayloadAction::Skip {
+                decision: HookOutcome::Deny,
+                reason: "skip:deny_rule",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_codex_skip_reasons_remain_distinct() {
+        for (command, mode, expected) in [
+            ("git status", None, "skip:unsupported_permission_mode"),
+            (
+                "git status",
+                Some("futureMode"),
+                "skip:unsupported_permission_mode",
+            ),
+            ("git status $(whoami)", Some("default"), "skip:defer"),
+            ("htop", Some("default"), "skip:no_rewrite"),
+        ] {
+            let input: Value =
+                serde_json::from_str(&codex_input_with_permission_mode(command, mode)).unwrap();
+            let PayloadAction::Skip { reason, .. } = process_codex_payload(&input) else {
+                panic!("expected skip for {command}")
+            };
+            assert_eq!(reason, expected);
+        }
     }
 
     #[test]

@@ -34,6 +34,7 @@ pub fn check_command(cmd: &str) -> PermissionVerdict {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Host {
     Claude,
+    Codex,
     Cursor,
     Gemini,
     Droid,
@@ -57,6 +58,10 @@ pub(crate) fn load_rules_for(host: Host) -> (Vec<String>, Vec<String>, Vec<Strin
         Host::Cursor => load_cursor_rules(),
         Host::Gemini => load_gemini_rules(),
         Host::Droid => load_droid_rules(),
+        // Codex enforces its native execution rules after updatedInput. Do not
+        // interpret its rules as Claude Bash patterns or borrow another host's
+        // settings. No RTK-side match means Default, not an explicit Allow.
+        Host::Codex => (Vec::new(), Vec::new(), Vec::new()),
         Host::Vibe => (Vec::new(), Vec::new(), Vec::new()),
     }
 }
