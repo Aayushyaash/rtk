@@ -130,7 +130,9 @@ rtk read - [options]          # Lecture depuis stdin
 | Option | Court | Defaut | Description |
 |--------|-------|--------|-------------|
 | `--level` | `-l` | `minimal` | Niveau de filtrage : `none`, `minimal`, `aggressive` |
-| `--max-lines` | `-m` | illimite | Nombre maximum de lignes |
+| `--max-lines` | `-m` | illimite | Apercu structurel plafonne a N lignes (signatures et imports, pas les N premieres) |
+| `--head-lines` | | illimite | Garde seulement les N premieres lignes, a l'octet pres |
+| `--tail-lines` | | illimite | Garde seulement les N dernieres lignes, a l'octet pres |
 | `--line-numbers` | `-n` | non | Afficher les numeros de ligne |
 
 **Niveaux de filtrage :**
