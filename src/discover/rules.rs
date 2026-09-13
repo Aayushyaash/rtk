@@ -153,10 +153,10 @@ pub const RULES: &[RtkRule] = &[
         // Unlike grep/rg, `rtk ast-grep`'s run() execs with stdin null (no
         // piped-stdin support yet), so it must not be rewritten as a
         // pipeline's final stage — that would silently drop the pipe input.
-        pipeline_final_safe: false,
+        pipeline_safety: PipelineSafety::ProducerOnly,
         rewrite_prefixes: &["ast-grep"],
         category: "Files",
-        savings_pct: 60.0,
+        savings_pct: 85.0,
         ..RtkRule::DEFAULT
     },
     RtkRule {

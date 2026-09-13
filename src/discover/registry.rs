@@ -2417,6 +2417,7 @@ mod tests {
         assert_eq!(
             safe_rules,
             vec![
+                "rtk ast-grep",
                 "rtk brew",
                 "rtk bundle",
                 "rtk cargo",
