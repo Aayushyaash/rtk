@@ -197,14 +197,14 @@ pub fn uninstall_antigravity_mode_at(
 /// Returns true if an Antigravity RTK plugin is configured (workspace or global).
 pub fn is_configured() -> bool {
     // 1. Workspace plugin
-    if let Ok(cwd) = std::env::current_dir() {
+    if let Ok(cwd) = user_dirs::current_dir() {
         let ws = cwd.join(".agents/plugins/rtk");
         if ws.join("plugin.json").is_file() || ws.join("hooks.json").is_file() {
             return true;
         }
     }
     // 2. Global plugin
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = user_dirs::home() {
         let global = home.join(".gemini/config/plugins/rtk");
         if global.join("plugin.json").is_file() || global.join("hooks.json").is_file() {
             return true;
