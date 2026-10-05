@@ -1013,7 +1013,8 @@ enum HookCommands {
     Antigravity,
     /// Process Mistral Vibe CLI pre_tool hook (reads JSON from stdin)
     Vibe,
-    /// Answer for OpenCode's plugin: the rewrite and the verdict, as JSON
+    /// Answer for OpenCode's plugin: the rewrite as JSON, or `{}` when
+    /// rewriting would change what OpenCode's own permission rules decide
     Opencode {
         /// Active OpenCode agent, when its rules scope permissions by one
         #[arg(long)]

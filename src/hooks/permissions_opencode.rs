@@ -1,5 +1,6 @@
 use super::constants::{CONFIG_DIR, OPENCODE_SUBDIR};
 use super::permissions::PermissionVerdict;
+use crate::core::user_dirs;
 use crate::discover::lexer::{contains_unattestable_construct, split_for_permissions};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -88,10 +89,9 @@ pub(crate) fn evaluate(cmd: &str, rules: &[Rule]) -> Option<Action> {
 }
 
 pub(crate) fn check_command_with_opencode_rules(cmd: &str, rules: &[Rule]) -> PermissionVerdict {
+    // `split_for_permissions` returns trimmed, non-empty segments only.
     let actions: Vec<Option<Action>> = split_for_permissions(cmd)
         .iter()
-        .map(|segment| segment.trim())
-        .filter(|segment| !segment.is_empty())
         .map(|segment| evaluate(segment, rules))
         .collect();
 
@@ -107,7 +107,7 @@ pub(crate) fn check_command_with_opencode_rules(cmd: &str, rules: &[Rule]) -> Pe
         return PermissionVerdict::Default;
     }
 
-    if !rules.is_empty() && actions.iter().all(|a| *a == Some(Action::Allow)) {
+    if actions.iter().all(|a| *a == Some(Action::Allow)) {
         return PermissionVerdict::Allow;
     }
 
@@ -167,7 +167,7 @@ fn append_rules(permission: &Value, rules: &mut Vec<Rule>) {
 fn opencode_configs() -> Vec<Value> {
     let mut configs = Vec::new();
 
-    if let Some(path) = std::env::var_os("OPENCODE_CONFIG") {
+    if let Some(path) = user_dirs::env_path("OPENCODE_CONFIG") {
         if let Some(v) = read_config(Path::new(&path)) {
             configs.push(v);
         }
@@ -183,19 +183,14 @@ fn opencode_configs() -> Vec<Value> {
 }
 
 fn global_opencode_dir() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(CONFIG_DIR).join(OPENCODE_SUBDIR))
+    Some(user_dirs::home()?.join(CONFIG_DIR).join(OPENCODE_SUBDIR))
 }
 
 fn project_root_with_config() -> Option<PathBuf> {
-    let mut dir = std::env::current_dir().ok()?;
-    loop {
-        if CONFIG_NAMES.iter().any(|name| dir.join(name).is_file()) {
-            return Some(dir);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
+    let start = user_dirs::current_dir().ok()?;
+    user_dirs::ancestors(&start)
+        .find(|dir| CONFIG_NAMES.iter().any(|name| dir.join(name).is_file()))
+        .map(Path::to_path_buf)
 }
 
 const CONFIG_NAMES: [&str; 2] = ["opencode.json", "opencode.jsonc"];
@@ -365,6 +360,26 @@ mod tests {
     }
 
     #[test]
+    fn an_ask_rule_reports_ask_not_default() {
+        let rules = [rule("git push *", Action::Ask)];
+        assert_eq!(
+            check_command_with_opencode_rules("git push origin main", &rules),
+            PermissionVerdict::Ask
+        );
+    }
+
+    #[test]
+    fn a_denied_segment_pre_empts_the_unattestable_ask() {
+        // Deny is checked before the unattestable gate: a command that is both
+        // must report Deny, or a deny rule could be softened to a prompt.
+        let rules = [rule("rm *", Action::Deny)];
+        assert_eq!(
+            check_command_with_opencode_rules("echo $(date) && rm -rf /", &rules),
+            PermissionVerdict::Deny
+        );
+    }
+
+    #[test]
     fn config_rules_keep_the_order_the_file_declares() {
         let config: Value = serde_json::from_str(
             r#"{ "bash": { "git push *": "deny", "git *": "allow", "aaa": "ask" } }"#,
@@ -394,5 +409,167 @@ mod tests {
         let mut rules = Vec::new();
         append_rules(&config, &mut rules);
         assert!(rules.is_empty());
+    }
+
+    // --- Config discovery (runs against the test scratch, never the
+    // developer's own ~/.config/opencode or working directory) ---
+
+    use crate::core::test_isolation;
+    use crate::core::user_env;
+
+    fn write_json(path: &Path, content: &str) {
+        std::fs::create_dir_all(path.parent().expect("config path has a parent"))
+            .expect("create config directory");
+        std::fs::write(path, content).expect("write config file");
+    }
+
+    #[test]
+    fn a_project_config_is_found_from_a_subdirectory() {
+        let tmp = test_isolation::tempdir();
+        let root = tmp.path().join("project");
+        let sub = root.join("src").join("deep");
+        std::fs::create_dir_all(&sub).expect("create subdirectory");
+        write_json(
+            &root.join("opencode.json"),
+            r#"{ "permission": { "bash": "deny" } }"#,
+        );
+
+        test_isolation::with_root(&tmp.path().join("home"), || {
+            let _entered = test_isolation::enter(&sub);
+            let rules = load_opencode_rules(None);
+            assert_eq!(rules, vec![rule("*", Action::Deny)]);
+        });
+    }
+
+    #[test]
+    fn the_project_rule_wins_because_it_loads_after_the_global_one() {
+        let tmp = test_isolation::tempdir();
+        let home = tmp.path().join("home");
+        write_json(
+            &home
+                .join(CONFIG_DIR)
+                .join(OPENCODE_SUBDIR)
+                .join("opencode.json"),
+            r#"{ "permission": { "bash": { "git *": "deny" } } }"#,
+        );
+        let project = tmp.path().join("project");
+        write_json(
+            &project.join("opencode.json"),
+            r#"{ "permission": { "bash": { "git *": "allow" } } }"#,
+        );
+
+        test_isolation::with_root(&home, || {
+            let _entered = test_isolation::enter(&project);
+            let rules = load_opencode_rules(None);
+            assert_eq!(
+                rules,
+                vec![rule("git *", Action::Deny), rule("git *", Action::Allow)],
+                "global loads first, project after — last match wins"
+            );
+            assert_eq!(
+                check_command_with_opencode_rules("git status", &rules),
+                PermissionVerdict::Allow
+            );
+        });
+    }
+
+    #[test]
+    fn opencode_config_env_replaces_the_global_file_not_the_project_one() {
+        let tmp = test_isolation::tempdir();
+        let home = tmp.path().join("home");
+        write_json(
+            &home
+                .join(CONFIG_DIR)
+                .join(OPENCODE_SUBDIR)
+                .join("opencode.json"),
+            r#"{ "permission": { "bash": { "git *": "deny" } } }"#,
+        );
+        let pointed = tmp.path().join("elsewhere").join("my-config.json");
+        write_json(
+            &pointed,
+            r#"{ "permission": { "bash": { "git *": "ask" } } }"#,
+        );
+
+        test_isolation::with_root(&home, || {
+            user_env::with_path("OPENCODE_CONFIG", Some(&pointed), || {
+                let rules = load_opencode_rules(None);
+                assert_eq!(
+                    rules,
+                    vec![rule("git *", Action::Ask)],
+                    "OPENCODE_CONFIG replaces the global lookup, as OpenCode does"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn json_is_read_before_jsonc_in_the_same_directory() {
+        let tmp = test_isolation::tempdir();
+        let project = tmp.path().join("project");
+        write_json(
+            &project.join("opencode.json"),
+            r#"{ "permission": { "bash": { "git *": "allow" } } }"#,
+        );
+        write_json(
+            &project.join("opencode.jsonc"),
+            r#"{ "permission": { "bash": { "git *": "deny" } } }"#,
+        );
+
+        test_isolation::with_root(&tmp.path().join("home"), || {
+            let _entered = test_isolation::enter(&project);
+            let rules = load_opencode_rules(None);
+            assert_eq!(rules, vec![rule("git *", Action::Allow)]);
+        });
+    }
+
+    /// `check_command_for_agent` must route `Host::OpenCode` through this
+    /// module's rules, not another host's (empty) rule source, where every
+    /// verdict would collapse to `Default`.
+    #[test]
+    fn check_command_for_agent_consults_opencode_rules() {
+        use crate::hooks::permissions::{Host, check_command_for_agent};
+
+        let tmp = test_isolation::tempdir();
+        let project = tmp.path().join("project");
+        write_json(
+            &project.join("opencode.json"),
+            r#"{ "permission": { "bash": "deny" } }"#,
+        );
+
+        test_isolation::with_root(&tmp.path().join("home"), || {
+            let _entered = test_isolation::enter(&project);
+            assert_eq!(
+                check_command_for_agent("git status", Host::OpenCode, None),
+                PermissionVerdict::Deny
+            );
+        });
+    }
+
+    #[test]
+    fn agent_rules_load_after_root_rules_so_they_win_ties() {
+        let tmp = test_isolation::tempdir();
+        let project = tmp.path().join("project");
+        write_json(
+            &project.join("opencode.json"),
+            r#"{
+                "permission": { "bash": { "git *": "deny" } },
+                "agent": {
+                    "staged-review": { "permission": { "bash": { "git *": "allow" } } }
+                }
+            }"#,
+        );
+
+        test_isolation::with_root(&tmp.path().join("home"), || {
+            let _entered = test_isolation::enter(&project);
+            let rules = load_opencode_rules(Some("staged-review"));
+            assert_eq!(
+                rules,
+                vec![rule("git *", Action::Deny), rule("git *", Action::Allow)],
+                "the agent block appends after root, matching OpenCode's resolution"
+            );
+
+            let without_agent = load_opencode_rules(None);
+            assert_eq!(without_agent, vec![rule("git *", Action::Deny)]);
+        });
     }
 }

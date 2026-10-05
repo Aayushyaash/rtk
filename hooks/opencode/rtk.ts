@@ -1,15 +1,20 @@
 import type { Plugin } from "@opencode-ai/plugin"
 
 // RTK OpenCode plugin — rewrites commands to use rtk for token savings.
-// Requires: rtk >= 0.23.0 in PATH.
+// Requires: an rtk with the `rtk hook opencode` subcommand (newer than
+// v0.51). An older rtk answers nothing, so commands pass through unrewritten
+// rather than breaking.
 //
-// This is a thin delegating plugin: all rewrite logic lives in `rtk hook opencode`,
-// which is the single source of truth (src/discover/registry.rs).
-// To add or change rewrite rules, edit the Rust registry — not this file.
+// This is a thin delegating plugin: all rewrite and permission logic lives
+// in `rtk hook opencode`, which is the single source of truth
+// (src/discover/registry.rs). It judges the command against OpenCode's own
+// permission rules and answers `{}` whenever the rewrite would change what
+// those rules decide — OpenCode evaluates the final command itself, so a
+// rewrite RTK does return never lifts a deny, silences an ask, or blocks an
+// allow. To add or change rewrite rules, edit the Rust registry — not this
+// file.
 
-type Answer = { command?: string; status?: "allow" | "ask" | "deny" }
-
-const MAX_PENDING = 256
+type Answer = { command?: string }
 
 export const RtkOpenCodePlugin: Plugin = async ({ $ }) => {
   try {
@@ -17,17 +22,6 @@ export const RtkOpenCodePlugin: Plugin = async ({ $ }) => {
   } catch {
     console.warn("[rtk] rtk binary not found in PATH — plugin disabled")
     return {}
-  }
-
-  const pending = new Map<string, "allow" | "ask" | "deny">()
-
-  const remember = (callID: string | undefined, status: Answer["status"]) => {
-    if (!callID || !status) return
-    if (pending.size >= MAX_PENDING) {
-      const oldest = pending.keys().next()
-      if (!oldest.done) pending.delete(oldest.value)
-    }
-    pending.set(callID, status)
   }
 
   return {
@@ -43,22 +37,12 @@ export const RtkOpenCodePlugin: Plugin = async ({ $ }) => {
       try {
         const result = await $`rtk hook opencode ${command}`.quiet().nothrow()
         const answer = JSON.parse(String(result.stdout).trim() || "{}") as Answer
-        remember(input?.callID, answer.status)
         if (answer.command && answer.command !== command) {
           ;(args as Record<string, unknown>).command = answer.command
         }
       } catch {
-        // rtk rewrite failed — pass through unchanged
+        // rtk hook opencode failed or answered nothing — pass through unchanged
       }
-    },
-
-    "permission.ask": async (input, output) => {
-      const callID = input?.callID
-      if (!callID) return
-      const status = pending.get(callID)
-      if (!status) return
-      pending.delete(callID)
-      output.status = status
     },
   }
 }
