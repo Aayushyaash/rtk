@@ -1210,14 +1210,14 @@ fn opencode_answer_for(cmd: &str, agent: Option<&str>) -> Value {
 /// Decide what the plugin should do with `cmd` under OpenCode's own rules.
 ///
 /// OpenCode evaluates whatever command the plugin hands back against the
-/// user's permission rules itself — plugins cannot influence that verdict
-/// (no OpenCode release triggers a `permission.ask` plugin hook, verified
-/// on 1.1.4–2.0.22). So the one thing RTK must guarantee is that the
-/// rewrite never changes what those rules decide: whenever the verdict for
-/// `rtk <cmd>` differs from the verdict for `cmd` as typed, RTK steps aside
-/// and returns `{}`, trading token savings on that command for the user's
-/// own policy (#4195). An allow stays an allow, an ask stays a prompt, and
-/// a deny stays denied — RTK never blocks, lifts or silences anything.
+/// user's permission rules itself, and from 1.1.4 on plugins cannot
+/// influence that verdict: there is no `permission.ask` plugin hook (1.0.142
+/// had one). So the one thing RTK must guarantee is that the rewrite never
+/// changes what those rules decide: whenever the verdict for `rtk <cmd>`
+/// differs from the verdict for `cmd` as typed, RTK steps aside and returns
+/// `{}`, trading token savings on that command for the user's own policy
+/// (#4195). An allow stays an allow, an ask stays a prompt, and a deny stays
+/// denied — RTK never blocks, lifts or silences anything.
 fn opencode_answer(cmd: &str, rules: &[permissions_opencode::Rule]) -> Value {
     if cmd.trim().is_empty() {
         return json!({});

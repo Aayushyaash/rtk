@@ -474,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_config_env_replaces_the_global_file_not_the_project_one() {
+    fn opencode_config_env_is_read_instead_of_the_global_file() {
         let tmp = test_isolation::tempdir();
         let home = tmp.path().join("home");
         write_json(
@@ -496,9 +496,32 @@ mod tests {
                 assert_eq!(
                     rules,
                     vec![rule("git *", Action::Ask)],
-                    "OPENCODE_CONFIG replaces the global lookup, as OpenCode does"
+                    "rtk reads OPENCODE_CONFIG instead of the global file"
                 );
             });
+        });
+    }
+
+    #[test]
+    fn the_nearest_project_config_is_the_one_read() {
+        let tmp = test_isolation::tempdir();
+        let outer = tmp.path().join("outer");
+        let inner = outer.join("inner");
+        let sub = inner.join("src");
+        std::fs::create_dir_all(&sub).expect("create subdirectory");
+        write_json(
+            &outer.join("opencode.json"),
+            r#"{ "permission": { "bash": "deny" } }"#,
+        );
+        write_json(
+            &inner.join("opencode.json"),
+            r#"{ "permission": { "bash": "allow" } }"#,
+        );
+
+        test_isolation::with_root(&tmp.path().join("home"), || {
+            let _entered = test_isolation::enter(&sub);
+            let rules = load_opencode_rules(None);
+            assert_eq!(rules, vec![rule("*", Action::Allow)]);
         });
     }
 
